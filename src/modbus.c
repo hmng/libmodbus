@@ -180,7 +180,7 @@ static unsigned int compute_response_size(modbus_param_t *mb_param,
 	}
 
 	response_size_computed += offset + mb_param->checksum_size;
-
+	}
 	return response_size_computed;
 }
 
@@ -552,7 +552,7 @@ static int modbus_response(modbus_param_t *mb_param,
 		/* No error */
 		int ret;
 
-		ret = check_crc16(mb_param, response, response_size);
+		ret = check_crc(mb_param, response, response_size);
 		if (ret != TRUE)
 			return ret;
 
