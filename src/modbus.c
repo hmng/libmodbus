@@ -132,7 +132,7 @@ static void error_treat(int ret, const char *message, modbus_param_t *mb_param)
 		perror(message);
 	g_print("\n\nERROR %s\n\n", message);
 
-	if (mb_param->type_com == RTU) {
+	if (mb_param->type_com == RTU || mb_param->type_com == ASCII) {
 		tcflush(mb_param->fd, TCIOFLUSH);
 	} else {
 		modbus_close(mb_param);
@@ -147,7 +147,19 @@ static unsigned int compute_response_size(modbus_param_t *mb_param,
 	int offset;
 
 	offset = mb_param->header_length;
+	if (mb_param->type_com == ASCII) {
+		switch (dehex(&query[offset + 3])) {
+		case 0x03:
+		case 0x04:
+			response_size_computed = 6 + 4 * (dehex(&query[offset + 9]) << 8
+					| dehex(&query[offset + 11]));
+			break;
+		default:
+			response_size_computed = 6;
+		}
 
+		response_size_computed += offset + mb_param->checksum_size + 2; //2 for CR & LF
+	} else {
 	switch (query[offset + 1]) {
 	case 0x01: {
 		/* Header + nb values (code from force_multiple_coils) */
@@ -185,6 +197,34 @@ int build_request_packet_rtu(int slave, int function, int start_addr,
 	packet[5] = count & 0x00ff;
 
 	return PRESET_QUERY_SIZE_RTU;
+}
+
+void hex(int n, unsigned char *ch) {
+	int n1;
+	n1 = n >> 4;
+	*ch = n1 < 10 ? '0' + n1 : '0' + n1 + 7;
+	n1 = n & 0x0F;
+	*(ch + 1) = (n1 < 10 ? '0' + n1 : '0' + n1 + 7);
+}
+
+unsigned char dehex(unsigned char *ch) {
+	unsigned char result;
+	result = (*ch > '9' ? *ch - '0' - 7 : *ch - '0');
+	ch++;
+	result = (result << 4) + (*ch > '9' ? *ch - '0' - 7 : *ch - '0');
+	return result;
+}
+
+int build_request_packet_ascii(int slave, int function, int start_addr,
+		int count, unsigned char *packet) {
+	packet[0] = ':';
+	hex(slave, packet + 1);
+	hex(function, packet + 3);
+	hex(start_addr >> 8, packet + 5);
+	hex(start_addr & 0x00ff, packet + 7);
+	hex(count >> 8, packet + 9);
+	hex(count & 0x00ff, packet + 11);
+	return PRESET_QUERY_SIZE_ASCII;
 }
 
 int build_request_packet_tcp(int slave, int function, int start_addr,
@@ -234,6 +274,9 @@ int build_request_packet(modbus_param_t *mb_param, int slave,
 	if (mb_param->type_com == RTU)
 		return build_request_packet_rtu(slave, function, start_addr,
 						count, packet);
+	else if (mb_param->type_com == ASCII)
+		return build_request_packet_ascii(slave, function, start_addr,
+				count, packet);
 	else
 		return build_request_packet_tcp(slave, function, start_addr,
 						count, packet);
@@ -257,6 +300,18 @@ static unsigned short crc16(unsigned char *buffer,
 	return (crc_hi << 8 | crc_lo);
 }
 
+/* LRC */
+static unsigned char lrc8(unsigned char *buffer, unsigned short buffer_length) {
+	unsigned char uchLRC = 0; /* LRC char initialized */
+	while (buffer_length) {
+		/* pass through message buffer */
+		uchLRC += dehex(buffer);
+		buffer += 2;
+		buffer_length -= 2;
+	}
+	return ((unsigned char) (-((char) uchLRC))); /* return twos complement */
+}
+
 /* Function to send a query out to a modbus slave */
 static int modbus_query(modbus_param_t *mb_param, unsigned char *query,
 			size_t query_size)
@@ -269,6 +324,12 @@ static int modbus_query(modbus_param_t *mb_param, unsigned char *query,
 		s_crc = crc16(query, query_size);
 		query[query_size++] = s_crc >> 8;
 		query[query_size++] = s_crc & 0x00FF;
+	} else if (mb_param->type_com == ASCII) {
+		unsigned char lrc = lrc8(query + 1, query_size - 1);
+		hex(lrc, &query[query_size]);
+		query_size += 2; //added LRC
+		query[query_size++] = '\r';
+		query[query_size++] = '\n';
 	} else {
 		set_packet_length_tcp(query, query_size);
 	}
@@ -276,15 +337,21 @@ static int modbus_query(modbus_param_t *mb_param, unsigned char *query,
 	if (mb_param->debug) {
 		g_print("\n");
 		for (i = 0; i < query_size; i++)
+			if (mb_param->type_com == ASCII) {
+				if (query[i] != '\r' && query[i] != '\n')
+					g_print("[%c]", query[i]);
+			} else
 			g_print("[%.2X]", query[i]);
 
 		g_print("\n");
 	}
 	
-	if (mb_param->type_com == RTU)
-		write_ret = write(mb_param->fd, query, query_size);
-	else
+	if (mb_param->type_com == TCP)
 		write_ret = send(mb_param->fd, query, query_size, 0);
+	else {//ASCII || RTU
+		tcflush(mb_param->fd, TCIOFLUSH);
+		write_ret = write(mb_param->fd, query, query_size);
+	}
 
 	/* Return the number of bytes written (0 to n)
 	   or PORT_SOCKET_FAILURE on error */
@@ -354,7 +421,7 @@ int receive_response(modbus_param_t *mb_param,
 	p_response = response;
 
 	while (select_ret) {
-		if (mb_param->type_com == RTU)
+		if (mb_param->type_com == RTU || mb_param->type_com == ASCII)
 			read_ret = read(mb_param->fd, p_response, size_to_read);
 		else
 			read_ret = recv(mb_param->fd, p_response, size_to_read, 0);
@@ -401,10 +468,14 @@ int receive_response(modbus_param_t *mb_param,
 		g_print("\n");
 
 	/* OK */
+	if (mb_param->type_com == ASCII && response[0] == ':') {
+		memmove(response, response + 1, --(*response_size));
+		--(*response_size); //strip CR (LF was striped by tty driver)
+	}
 	return 0;
 }
 
-static int check_crc16(modbus_param_t *mb_param,
+static int check_crc(modbus_param_t *mb_param,
 		       unsigned char *response,
 		       int response_size)
 {
@@ -413,18 +484,25 @@ static int check_crc16(modbus_param_t *mb_param,
 	if (mb_param->type_com == RTU) {
 		unsigned short crc_calc;
 		unsigned short crc_received;
-		unsigned char recv_crc_hi;
-		unsigned char recv_crc_lo;
 		
 		crc_calc = crc16(response, response_size - 2);
+		crc_received = (response[response_size - 2] << 8)
+				| response[response_size - 1];
 		
-		recv_crc_hi = (unsigned) response[response_size - 2];
-		recv_crc_lo = (unsigned) response[response_size - 1];
+		/* Check CRC of response */
+		if (crc_calc == crc_received) {
+			ret = TRUE;
+		} else {
+			printf("invalid crc received %0X - crc_calc %0X", crc_received,
+					crc_calc);
+			ret = INVALID_CRC;
+		}
+	} else if (mb_param->type_com == ASCII) {
+		unsigned char crc_calc;
+		unsigned char crc_received;
 		
-		crc_received = response[response_size - 2];
-		crc_received = (unsigned) crc_received << 8;
-		crc_received = crc_received | 
-			(unsigned) response[response_size - 1];
+		crc_calc = lrc8(response, response_size - 2);
+		crc_received = dehex(&response[response_size - 2]);
 		
 		/* Check CRC of response */
 		if (crc_calc == crc_received) {
@@ -479,7 +557,8 @@ static int modbus_response(modbus_param_t *mb_param,
 			return ret;
 
 		/* Good response */
-		switch (response[offset + 1]) {
+		switch ((mb_param->type_com == ASCII) ? dehex(&response[2])
+				: response[offset + 1]) {
 		case 0x01:
 		case 0x02:
 			/* Read functions 1 value = 1 byte */
@@ -488,6 +567,9 @@ static int modbus_response(modbus_param_t *mb_param,
 		case 0x03:
 		case 0x04:
 			/* Read functions 1 value = 2 bytes */
+			if (mb_param->type_com == ASCII)
+				response_size = dehex(&response[offset + 4]) / 2;
+			else
 			response_size = response[offset + 2] / 2;
 			break;
 		case 0x0F:
@@ -512,7 +594,7 @@ static int modbus_response(modbus_param_t *mb_param,
 		int ret;
 		
 		/* CRC */
-		ret = check_crc16(mb_param, response, response_size);
+		ret = check_crc(mb_param, response, response_size);
 		if (ret != TRUE)
 			return ret;
 
@@ -699,14 +781,21 @@ static int read_reg_response(modbus_param_t *mb_param, int *data_dest,
 	response_ret = modbus_response(mb_param, query, response);
 	
 	offset = mb_param->header_length;
-
+	if (mb_param->type_com == ASCII) {
 	/* If response_ret is negative, the loop is jumped ! */
 	for (i = 0; i < response_ret; i++) {
 		/* shift reg hi_byte to temp OR with lo_byte */
-		data_dest[i] = response[offset + 3 + (i << 1)] << 8 | 
-			response[offset + 4 + (i << 1)];    
+			data_dest[i] = dehex(&response[offset + 6 + (i << 2)]) << 8
+					| dehex(&response[offset + 8 + (i << 2)]);
+		}
+	} else
+		//TCP || RTU
+		/* If response_ret is negative, the loop is jumped ! */
+		for (i = 0; i < response_ret; i++) {
+			/* shift reg hi_byte to temp OR with lo_byte */
+			data_dest[i] = response[offset + 3 + (i << 1)] << 8
+					| response[offset + 4 + (i << 1)];
 	}
-	
 	return response_ret;
 }
 
@@ -783,6 +872,7 @@ int force_multiple_coils(modbus_param_t *mb_param, int slave,
 	int coil_check = 0;
 	int status;
 	int query_ret;
+	int pos = 0;
 
 	unsigned char query[MAX_PACKET_SIZE];
 
@@ -798,7 +888,6 @@ int force_multiple_coils(modbus_param_t *mb_param, int slave,
 
 	for (i = 0; i < byte_count; i++) {
 		int bit;
-		int pos = 0;
 
 		bit = 0x01;
 		query[query_size] = 0;
@@ -915,6 +1004,14 @@ void modbus_init_rtu(modbus_param_t *mb_param, char *device,
 	mb_param->type_com = RTU;
 	mb_param->header_length = HEADER_LENGTH_RTU;
 	mb_param->checksum_size = CHECKSUM_SIZE_RTU;
+}
+
+/* Initialises the modbus_param_t structure for ASCII */
+void modbus_init_ascii(modbus_param_t *mb_param, char *device, int baud_i,
+		char *parity, int data_bit, int stop_bit)
+{
+	modbus_init_rtu(mb_param, device, baud_i, parity, data_bit, stop_bit);
+	mb_param->type_com = ASCII;
 }
 
 /* Initialises the modbus_param_t structure for TCP */
@@ -1181,6 +1278,13 @@ static int modbus_connect_rtu(modbus_param_t *mb_param)
 	return 0;
 }
 
+/* This function sets up a serial port for ASCII communications to
+ modbus */
+static int modbus_connect_ascii(modbus_param_t *mb_param)
+{
+	return modbus_connect_rtu(mb_param);
+}
+
 static int modbus_connect_tcp(modbus_param_t *mb_param)
 {
 	int ret;
@@ -1238,9 +1342,10 @@ int modbus_connect(modbus_param_t *mb_param)
 
 	if (mb_param->type_com == RTU)
 		ret = modbus_connect_rtu(mb_param);
-	else
+	else if (mb_param->type_com == TCP)
 		ret = modbus_connect_tcp(mb_param);
-
+	else
+		ret = modbus_connect_ascii(mb_param);
 	return ret;
 }
 
@@ -1314,6 +1419,11 @@ static void modbus_close_rtu(modbus_param_t *mb_param)
 	close(mb_param->fd);
 }
 
+static void modbus_close_ascii(modbus_param_t *mb_param)
+{
+	modbus_close_rtu(mb_param);
+}
+
 static void modbus_close_tcp(modbus_param_t *mb_param)
 {
 	shutdown(mb_param->fd, SHUT_RDWR);
@@ -1324,8 +1434,10 @@ void modbus_close(modbus_param_t *mb_param)
 {
 	if (mb_param->type_com == RTU)
 		modbus_close_rtu(mb_param);
-	else
+	else if (mb_param->type_com == TCP)
 		modbus_close_tcp(mb_param);
+	else
+		modbus_close_ascii(mb_param);
 }
 
 void modbus_set_debug(modbus_param_t *mb_param, int boolean)
